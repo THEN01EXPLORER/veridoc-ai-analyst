@@ -12,6 +12,10 @@ from pydantic import BaseModel, EmailStr
 from typing import Optional
 import jwt
 from datetime import datetime, timedelta, timezone
+from sentence_transformers import SentenceTransformer
+from langchain.embeddings import HuggingFaceEmbeddings
+
+embeddings_model = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
 
 # --- LangChain & Pinecone Imports ---
 from langchain_community.document_loaders import PyPDFLoader
@@ -25,8 +29,7 @@ from pinecone import Pinecone
 load_dotenv()
 
 # --- Firebase Initialization ---
-# This is where we use your master key
-cred = credentials.Certificate("firebase-credentials.json")
+cred = credentials.Certificate(os.getenv("FIREBASE_CREDENTIALS_PATH", "firebase-credentials.json"))
 firebase_admin.initialize_app(cred)
 db = firestore.client()
 
@@ -37,7 +40,7 @@ SECRET_KEY = os.getenv("SECRET_KEY", "a_super_secret_key_for_dev_that_should_be_
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
 
-# --- Pydantic Models for User Data ---
+# --- Pydantic Models ---
 class UserCreate(BaseModel):
     email: EmailStr
     password: str
@@ -50,7 +53,7 @@ class Token(BaseModel):
     access_token: str
     token_type: str
 
-# --- CONFIGURATION & VALIDATION ---
+# --- CONFIGURATION ---
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME")
@@ -58,6 +61,7 @@ PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME")
 if not all([OPENAI_API_KEY, PINECONE_API_KEY, PINECONE_INDEX_NAME]):
     raise ValueError("⚠️  Missing one or more environment variables.")
 
+# Ensure Pinecone API key available in os.environ for LangChain
 if PINECONE_API_KEY:
     os.environ['PINECONE_API_KEY'] = PINECONE_API_KEY
 
@@ -67,7 +71,7 @@ pc = Pinecone(api_key=PINECONE_API_KEY)
 
 app = FastAPI(title="VeriDoc AI Analyst API", version="2.0.0 (SaaS Ready)")
 
-# --- Helper Functions for Security ---
+# --- Helper Functions ---
 def verify_password(plain_password, hashed_password):
     return pwd_context.verify(plain_password, hashed_password)
 
@@ -76,31 +80,33 @@ def get_password_hash(password):
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     to_encode = data.copy()
-    if expires_delta:
-        expire = datetime.now(timezone.utc) + expires_delta
-    else:
-        expire = datetime.now(timezone.utc) + timedelta(minutes=15)
+    expire = datetime.now(timezone.utc) + (expires_delta if expires_delta else timedelta(minutes=15))
     to_encode.update({"exp": expire})
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
 
-# --- NEW Authentication Endpoints ---
+def get_current_user(token: str = Depends(oauth2_scheme)):
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_email: str = payload.get("sub")
+        if user_email is None:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid authentication credentials")
+        return user_email
+    except jwt.PyJWTError:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid authentication credentials")
+
+# --- AUTHENTICATION ---
 @app.post("/auth/signup", response_model=Token)
 async def signup(user: UserCreate):
     users_ref = db.collection('users')
     user_doc = users_ref.document(user.email).get()
     if user_doc.exists:
         raise HTTPException(status_code=400, detail="Email already registered")
-    
     hashed_password = get_password_hash(user.password)
-    # Note: Pydantic v2 uses .model_dump() instead of .dict()
     new_user_data = {"email": user.email, "hashed_password": hashed_password}
     users_ref.document(user.email).set(new_user_data)
-
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    access_token = create_access_token(
-        data={"sub": user.email}, expires_delta=access_token_expires
-    )
+    access_token = create_access_token(data={"sub": user.email}, expires_delta=access_token_expires)
     return {"access_token": access_token, "token_type": "bearer"}
 
 @app.post("/auth/login", response_model=Token)
@@ -109,24 +115,24 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends()):
     user_doc = users_ref.document(form_data.username).get()
     if not user_doc.exists:
         raise HTTPException(status_code=400, detail="Incorrect email or password")
-    
     user_data = user_doc.to_dict()
     if not user_data or not verify_password(form_data.password, user_data.get("hashed_password")):
         raise HTTPException(status_code=400, detail="Incorrect email or password")
-
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    access_token = create_access_token(
-        data={"sub": form_data.username}, expires_delta=access_token_expires
-    )
+    access_token = create_access_token(data={"sub": form_data.username}, expires_delta=access_token_expires)
     return {"access_token": access_token, "token_type": "bearer"}
 
-# --- Your Existing Endpoints (Unchanged for now) ---
+# --- HEALTH CHECK ---
 @app.get("/")
 def read_root():
     return {"status": "ok", "message": "VeriDoc API is alive!"}
 
+# --- PDF Upload & Embedding ---
 @app.post("/upload-whitepaper/")
-async def upload_whitepaper(file: UploadFile = File(...)):
+async def upload_whitepaper(
+    file: UploadFile = File(...),
+    token: str = Depends(oauth2_scheme)
+):
     if file.content_type != "application/pdf":
         raise HTTPException(status_code=400, detail="Invalid file type.")
     tmp_file_path = None
@@ -154,8 +160,13 @@ async def upload_whitepaper(file: UploadFile = File(...)):
         if tmp_file_path and os.path.exists(tmp_file_path):
             os.remove(tmp_file_path)
 
+# --- Question Answering Endpoint ---
 @app.post("/ask-question/")
-async def ask_question(session_id: str = Body(...), query: str = Body(...)):
+async def ask_question(
+    session_id: str = Body(...),
+    query: str = Body(...),
+    token: str = Depends(oauth2_scheme)
+):
     try:
         vectorstore = PineconeVectorStore.from_existing_index(
             index_name=str(PINECONE_INDEX_NAME),
@@ -172,6 +183,6 @@ async def ask_question(session_id: str = Body(...), query: str = Body(...)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# --- MAIN ENTRYPOINT ---
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
-
